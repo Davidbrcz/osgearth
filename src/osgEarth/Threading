@@ -877,7 +877,7 @@ namespace osgEarth { namespace Threading
         // type of arena
         Type _type;
         // queued operations to run asynchronously
-        using Queue = std::vector<QueuedJob>;
+        using Queue = std::priority_queue<QueuedJob>;
         Queue _queue;
         // protect access to the queue
         mutable Mutex _queueMutex;
@@ -887,7 +887,8 @@ namespace osgEarth { namespace Threading
         // thread waiter block
         std::condition_variable_any _block;
         // set to true when threads should exit
-        bool _done;
+	std::atomic<bool> _done;
+	std::atomic<bool> _halting{false};
         // threads in the pool
         std::vector<std::thread> _threads;
         // pointer to the stats structure for this arena

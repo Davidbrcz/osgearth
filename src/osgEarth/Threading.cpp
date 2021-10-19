@@ -703,7 +703,7 @@ JobArena::dispatch(
         if (_targetConcurrency > 0)
         {
             std::lock_guard<Mutex> lock(_queueMutex);
-            _queue.emplace_back(job, delegate, sema);
+            _queue.emplace(job, delegate, sema);
             _metrics->numJobsPending++;
             _block.notify_one();
         }
@@ -722,7 +722,7 @@ JobArena::dispatch(
     else // _type == traversal
     {
         std::lock_guard<Mutex> lock(_queueMutex);
-        _queue.emplace_back(job, delegate, sema);
+        _queue.emplace(job, delegate, sema);
         _metrics->numJobsPending++;
     }
 }
@@ -733,7 +733,7 @@ JobArena::runJobs()
     // cap the number of jobs to run (applies to TRAVERSAL modes only)
     int jobsLeftToRun = INT_MAX;
 
-    while (!_done)
+    while (!_halting)
     {
         QueuedJob next;
 
@@ -744,8 +744,12 @@ JobArena::runJobs()
             if (_type == THREAD_POOL)
             {
                 _block.wait(lock, [this] {
-                    return _queue.empty() == false || _done == true;
+                    return !_queue.empty() || _done;
                     });
+
+		if(_done) {
+		    break;
+		}
             }
             else // traversal type
             {
@@ -762,16 +766,9 @@ JobArena::runJobs()
 
             if (!_queue.empty() && !_done)
             {
-                // Quickly find the highest priority item in the "queue"
-                std::partial_sort(
-                    _queue.rbegin(), _queue.rbegin() + 1, _queue.rend(),
-                    [](const QueuedJob& lhs, const QueuedJob& rhs) {
-                        return lhs._job.getPriority() > rhs._job.getPriority();
-                    });
-
-                next = std::move(_queue.back());
+                next = std::move(_queue.top());
                 have_next = true;
-                _queue.pop_back();
+                _queue.pop();
             }
         }
 
@@ -854,31 +851,25 @@ JobArena::startThreads()
 
 void JobArena::stopThreads()
 {
-    _done = true;
 
+    _halting = true;
+    
     // Clear out the queue
     {
         std::lock_guard<Mutex> lock(_queueMutex);
+	_done = true;
 
         // reset any group semaphores so that JobGroup.join()
-        // will not deadlock.
-        for (auto& queuedjob : _queue)
-        {
-            if (queuedjob._groupsema != nullptr)
+        // will not deadlock and empty the queue as well
+	while(!_queue.empty())
+	{
+	    auto queuedjob = _queue.top();
+	    if (queuedjob._groupsema != nullptr)
             {
                 queuedjob._groupsema->reset();
             }
-        }
-        _queue.clear();
-
-        //while (_queue.empty() == false)
-        //{
-        //    if (_queue.back()._groupsema != nullptr)
-        //    {
-        //        _queue.back()._groupsema->reset();
-        //    }
-        //    _queue.pop_back();
-        //}
+	    _queue.pop();
+	}
 
         // wake up all threads so they can exit
         _block.notify_all();
