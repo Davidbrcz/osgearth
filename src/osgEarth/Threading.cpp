@@ -553,9 +553,7 @@ JobArena::Metrics JobArena::_allMetrics;
 JobArena::JobArena(const std::string& name, unsigned concurrency, const Type& type) :
     _name(name),
     _targetConcurrency(concurrency),
-    _type(type),
-    _done(false),
-    _queueMutex("OE.JobArena[" + name + "]")
+    _type(type)
 {
     // find a slot in the stats
     int new_index = -1;
@@ -597,6 +595,7 @@ JobArena::shutdownAll()
     ScopedMutexLock lock(_arenas_mutex);
     OE_INFO << LC << "Shutting down all job arenas." << std::endl;
     _arenas.clear();
+    OE_INFO << LC << "DONE Shutting down all job arenas." << std::endl;
 }
 
 JobArena*
@@ -702,10 +701,8 @@ JobArena::dispatch(
     {
         if (_targetConcurrency > 0)
         {
-            std::lock_guard<Mutex> lock(_queueMutex);
-            _queue.emplace_back(job, delegate, sema);
-            _metrics->numJobsPending++;
-            _block.notify_one();
+	    _queue.emplace(job, delegate, sema);
+	    _metrics->numJobsPending++;
         }
         else
         {
@@ -721,8 +718,7 @@ JobArena::dispatch(
 
     else // _type == traversal
     {
-        std::lock_guard<Mutex> lock(_queueMutex);
-        _queue.emplace_back(job, delegate, sema);
+        _queue.emplace(job, delegate, sema);
         _metrics->numJobsPending++;
     }
 }
@@ -730,106 +726,67 @@ JobArena::dispatch(
 void
 JobArena::runJobs()
 {
-    // cap the number of jobs to run (applies to TRAVERSAL modes only)
-    int jobsLeftToRun = INT_MAX;
-
-    while (!_done)
-    {
-        QueuedJob next;
-
-        bool have_next = false;
+    while (_queue.running())
         {
-            std::unique_lock<Mutex> lock(_queueMutex);
-            
-            if (_type == THREAD_POOL)
-            {
-                _block.wait(lock, [this] {
-                    return _queue.empty() == false || _done == true;
-                    });
-            }
-            else // traversal type
-            {
-                // Prevents jobs that re-queue themselves from running 
-                // during the same traversal frame.
-                if (jobsLeftToRun == INT_MAX)
+            if(_type == UPDATE_TRAVERSAL) {
+                if (jobsLeftToRun == INT_MAX) {
                     jobsLeftToRun = _queue.size();
-
+                }
                 if (_queue.empty() || jobsLeftToRun == 0)
-                {
-                    return;
-                }
-            }
-
-            if (!_queue.empty() && !_done)
-            {
-                // Quickly find the highest priority item in the "queue"
-                std::partial_sort(
-                    _queue.rbegin(), _queue.rbegin() + 1, _queue.rend(),
-                    [](const QueuedJob& lhs, const QueuedJob& rhs) {
-                        return lhs._job.getPriority() > rhs._job.getPriority();
-                    });
-
-                next = std::move(_queue.back());
-                have_next = true;
-                _queue.pop_back();
-            }
-        }
-
-        if (have_next)
-        {
-            _metrics->numJobsRunning++;
-            _metrics->numJobsPending--;
-
-            auto t0 = std::chrono::steady_clock::now();
-
-            bool job_executed = next._delegate();
-
-            auto duration = std::chrono::steady_clock::now() - t0;
-
-            if (job_executed)
-            {
-                jobsLeftToRun--;
-
-                if (_allMetrics._report != nullptr)
-                {
-                    if (duration >= _allMetrics._reportMinDuration)
                     {
-                        _allMetrics._report(Metrics::Report(next._job, _name, duration));
+                        return;
                     }
+            }
+
+            QueuedJob next;
+            if (_queue.interrupt_pop(next)) {
+                _metrics->numJobsRunning++;
+                _metrics->numJobsPending--;
+
+                auto t0 = std::chrono::steady_clock::now();
+                bool job_executed = next._delegate();
+                auto duration = std::chrono::steady_clock::now() - t0;
+
+                if (job_executed)
+                    {
+                        jobsLeftToRun--;
+
+                        if (_allMetrics._report != nullptr)
+                            {
+                                if (duration >= _allMetrics._reportMinDuration)
+                                    {
+                                        _allMetrics._report(Metrics::Report(next._job, _name, duration));
+                                    }
+                            }
+                    }
+                else {
+                    _metrics->numJobsCanceled++;
+                }
+
+                // release the group semaphore if necessary
+                if (next._groupsema != nullptr) {
+                    next._groupsema->release();
+                }
+
+                _metrics->numJobsRunning--;
+            }
+
+            if (_type == THREAD_POOL) {
+                // See if we no longer need this thread because the
+                // target concurrency has been reduced
+                ScopedMutexLock quitLock(_quitMutex);
+                if (_targetConcurrency < _metrics->concurrency) {
+                    _metrics->concurrency--;
+                    break;
                 }
             }
-            else
-            {
-                _metrics->numJobsCanceled++;
-            }
-
-            // release the group semaphore if necessary
-            if (next._groupsema != nullptr)
-            {
-                next._groupsema->release();
-            }
-
-            _metrics->numJobsRunning--;
         }
-
-        if (_type == THREAD_POOL)
-        {
-            // See if we no longer need this thread because the
-            // target concurrency has been reduced
-            ScopedMutexLock quitLock(_quitMutex);
-            if (_targetConcurrency < _metrics->concurrency)
-            {
-                _metrics->concurrency--;
-                break;
-            }
-        }
-    }
 }
 
 void
 JobArena::startThreads()
 {
-    _done = false;
+    // _done = false;
 
     OE_INFO << LC << "Arena \"" << _name << "\" concurrency=" << _targetConcurrency << std::endl;
 
@@ -843,10 +800,13 @@ JobArena::startThreads()
 
                 OE_THREAD_NAME(_name.c_str());
 
-                runJobs();
+				// cap the number of jobs to run (applies to TRAVERSAL modes only)
+				int jobsLeftToRun = INT_MAX;
+
+				runJobs();
 
                 // exit thread here
-                //OE_INFO << LC << "Thread " << std::this_thread::get_id() << " exiting" << std::endl;
+                OE_INFO << LC << "Thread " << std::this_thread::get_id() << " end loop" << std::endl;
             }
         ));
     }
@@ -854,34 +814,16 @@ JobArena::startThreads()
 
 void JobArena::stopThreads()
 {
-    _done = true;
+    _queue.stop();
 
     // Clear out the queue
-    {
-        std::lock_guard<Mutex> lock(_queueMutex);
-
-        // reset any group semaphores so that JobGroup.join()
-        // will not deadlock.
-        for (auto& queuedjob : _queue)
-        {
-            if (queuedjob._groupsema != nullptr)
-            {
-                queuedjob._groupsema->reset();
+    while(!_queue.empty()){
+        QueuedJob job;
+        if(_queue.try_pop(job)){
+            if (job._groupsema != nullptr) {
+                job._groupsema->reset();
             }
         }
-        _queue.clear();
-
-        //while (_queue.empty() == false)
-        //{
-        //    if (_queue.back()._groupsema != nullptr)
-        //    {
-        //        _queue.back()._groupsema->reset();
-        //    }
-        //    _queue.pop_back();
-        //}
-
-        // wake up all threads so they can exit
-        _block.notify_all();
     }
 
     // wait for them to exit
